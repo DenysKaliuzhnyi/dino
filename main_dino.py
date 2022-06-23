@@ -126,6 +126,11 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+
+    # My custom
+    parser.add_argument('--attn_only', action='store_true', help="Update only attention weights of the student network.") 
+    parser.add_argument('--run_name', type=str, default='exp', help="Name of the run to save weights.")
+    parser.add_argument('--weights', type=str, default='checkpoint.pth', help="Checkpoint weights to start with (in output_dir).")   
     return parser
 
 
@@ -203,12 +208,20 @@ def train_dino(args):
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
+    if args.attn_only:
+        for name_p, p in student.named_parameters():
+            if '.attn.' in name_p or '.head.' in name_p or '.pos_embed' in name_p:
+                p.requires_grad = True
+            else:
+                p.requires_grad = False
+            print(name_p.ljust(45), p.requires_grad)
+
     print(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
@@ -254,7 +267,7 @@ def train_dino(args):
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
     utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
+        os.path.join(args.output_dir, args.weights),
         run_variables=to_restore,
         student=student,
         teacher=teacher,
@@ -285,13 +298,14 @@ def train_dino(args):
         }
         if fp16_scaler is not None:
             save_dict['fp16_scaler'] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
+        os.makedirs(os.path.join(args.output_dir, args.run_name), exist_ok=True)
+        utils.save_on_master(save_dict, os.path.join(args.output_dir, args.run_name, 'checkpoint.pth'))
         if args.saveckp_freq and epoch % args.saveckp_freq == 0:
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, args.run_name, f'checkpoint{epoch:04}.pth'))
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      'epoch': epoch}
         if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
+            with (Path(args.output_dir) / args.run_name / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -428,6 +442,7 @@ class DataAugmentationDINO(object):
         ])
         normalize = transforms.Compose([
             transforms.ToTensor(),
+            #transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
